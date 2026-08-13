@@ -275,6 +275,24 @@ FA4 remains available by explicitly selecting the `FLASH_ATTN` backend:
 On Blackwell, `FLASH_ATTN` selects FA4. Confirm the server log contains
 `Using CuTe FlashAttention-4 on Blackwell` before recording FA4 measurements.
 
+SageAttention3 can be selected for the long main DiT attention while the short
+token refiner remains on exact TRTLLM attention:
+
+```bash
+--diffusion-attention-config '{
+  "default": {"backend": "SAGE_ATTN_3"},
+  "per_role": {
+    "minimax_h3.token_refiner": {"backend": "TRTLLM_ATTN"}
+  }
+}'
+```
+
+This path requires the separately installed `sageattn3` Blackwell package. It
+is opt-in and approximate; do not treat it as a lossless replacement for the
+default backend without target-workload accuracy validation. Packed-prefix
+execution supports H3's single valid sequence plus structural tail padding;
+other masks and general multi-document packing are rejected.
+
 `TRTLLM_ATTN` additionally supports two **lossy** optimizations for the long main
 DiT attention sequence: SAGE attention quantization and Skip-Softmax Sparse
 Attention. SAGE quantizes Q/K to the configured dtype and V to FP8. This example uses

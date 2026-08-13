@@ -398,6 +398,15 @@ Notes:
 
 - `SAGE_ATTN_3` is only selected on CUDA when `sageattn3` is importable and the GPU is Blackwell-class.
 - SageAttention3's Blackwell kernel assumes `Hq == Hkv`. In vLLM-Omni, GQA/MQA diffusion requests fall back to PyTorch SDPA for correctness.
+- `SAGE_ATTN_3` accepts MiniMax H3's packed `[valid | alignment padding]`
+  layout. It runs only the valid Q/K/V prefix and restores zero output rows for
+  the padding suffix before sequence-parallel post-processing.
+- Packed-prefix support is limited to one valid prefix plus structural tail
+  padding. Arbitrary attention masks and general multi-document packing are
+  rejected.
+- SageAttention3 is approximate. Keep accuracy-sensitive or short attention
+  roles on an exact backend and validate generated outputs for the target
+  workload.
 
 ## HuggingFace Kernels Hub Backends
 
