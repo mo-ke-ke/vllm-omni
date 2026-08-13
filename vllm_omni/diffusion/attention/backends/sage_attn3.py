@@ -50,6 +50,7 @@ _sageattn3_blackwell_op = torch.ops.vllm_omni.sageattn3_blackwell
 
 class SageAttention3Backend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_packed_prefix_slicing: bool = True
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
@@ -81,6 +82,30 @@ class SageAttention3Impl(AttentionImpl):
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
 
+    @staticmethod
+    def _packed_prefix_length(
+        attn_metadata: AttentionMetadata | None,
+    ) -> int | None:
+        if attn_metadata is None:
+            return None
+        return attn_metadata.extra.get("valid_kv_length")
+
+    @staticmethod
+    def _restore_physical_length(
+        output: torch.Tensor,
+        physical_length: int,
+    ) -> torch.Tensor:
+        padding = physical_length - output.shape[1]
+        if padding == 0:
+            return output
+        suffix = output.new_zeros(
+            output.shape[0],
+            padding,
+            output.shape[2],
+            output.shape[3],
+        )
+        return torch.cat((output, suffix), dim=1)
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -88,6 +113,13 @@ class SageAttention3Impl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        physical_length = query.shape[1]
+        valid_length = self._packed_prefix_length(attn_metadata)
+        if valid_length is not None:
+            query = query[:, :valid_length]
+            key = key[:, :valid_length]
+            value = value[:, :valid_length]
+
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
@@ -113,4 +145,5 @@ class SageAttention3Impl(AttentionImpl):
         else:
             output = _sageattn3_blackwell_op(query, key, value, self.causal)
 
-        return output.transpose(1, 2).contiguous()
+        output = output.transpose(1, 2).contiguous()
+        return self._restore_physical_length(output, physical_length)

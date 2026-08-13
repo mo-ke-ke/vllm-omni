@@ -23,6 +23,28 @@ def load_sage_attn3_module(monkeypatch: pytest.MonkeyPatch, kernel_impl):
     return importlib.import_module(SAGE_ATTN3_MODULE)
 
 
+def packed_metadata(
+    backend_module,
+    *,
+    valid_length: int,
+    physical_length: int,
+    dtype: torch.dtype = torch.int32,
+):
+    cu_seqlens = torch.tensor(
+        [0, valid_length, physical_length],
+        dtype=dtype,
+    )
+    return backend_module.AttentionMetadata(
+        extra={
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_k": cu_seqlens,
+            "max_seqlen_q": valid_length,
+            "max_seqlen_k": valid_length,
+            "valid_kv_length": valid_length,
+        }
+    )
+
+
 def test_sage_attn3_forward_uses_blackwell_layout(monkeypatch: pytest.MonkeyPatch):
     calls = {}
 
@@ -49,6 +71,43 @@ def test_sage_attn3_forward_uses_blackwell_layout(monkeypatch: pytest.MonkeyPatc
     assert calls["is_causal"] is False
     expected = (query.transpose(1, 2) + key.transpose(1, 2) + value.transpose(1, 2)).transpose(1, 2)
     assert torch.allclose(output, expected)
+
+
+def test_sage_attn3_packed_prefix_excludes_and_restores_padding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = {}
+
+    def fake_kernel(query, key, value, is_causal=False):
+        calls["shapes"] = (query.shape, key.shape, value.shape)
+        return query + key + value
+
+    backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
+    assert backend_module.SageAttention3Backend.supports_packed_prefix_slicing
+    impl = backend_module.SageAttention3Impl(
+        num_heads=4,
+        head_size=64,
+        softmax_scale=1.0 / 8.0,
+        causal=False,
+    )
+    query = torch.randn(2, 8, 4, 64)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    metadata = packed_metadata(
+        backend_module,
+        valid_length=5,
+        physical_length=8,
+    )
+
+    output = impl.forward_cuda(query, key, value, metadata)
+
+    assert calls["shapes"] == 3 * ((2, 4, 5, 64),)
+    torch.testing.assert_close(
+        output[:, :5],
+        query[:, :5] + key[:, :5] + value[:, :5],
+    )
+    assert output.shape == query.shape
+    assert torch.count_nonzero(output[:, 5:]) == 0
 
 
 def test_sage_attn3_falls_back_to_sdpa_for_gqa(monkeypatch: pytest.MonkeyPatch):
