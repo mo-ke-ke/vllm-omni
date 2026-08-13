@@ -413,11 +413,17 @@ class MiniMaxH3Attention(nn.Module):
         # Ring attention can dispatch to a different implementation from the
         # configured backend, so the no-mask fast paths are local-only.
         # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
+        # supports_packed_prefix_slicing: backend slices Q/K/V and restores Q.
         # supports_packed_mask_free: backend consumes the packed metadata
         # without ever reading attn_mask (CUDA packed varlen, NPU
         # npu_attn_varlen opt-in with its own fallback rebuild).
         no_mask = not getattr(self.attention, "use_ring", False) and (
             self.attention.attn_backend.supports_prefix_kv_slicing
+            or getattr(
+                self.attention.attn_backend,
+                "supports_packed_prefix_slicing",
+                False,
+            )
             or self.attention.attn_backend.supports_packed_mask_free()
         )
         if used < packed_total and not no_mask:

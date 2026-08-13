@@ -19,6 +19,9 @@ class AttentionBackend(ABC):
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
     supports_prefix_kv_slicing: bool = False
+    # The backend executes one valid Q/K/V prefix and restores zero output rows
+    # for the structural padding suffix.
+    supports_packed_prefix_slicing: bool = False
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
@@ -130,8 +133,8 @@ class AttentionMetadata:
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
     #     the packed cu_seqlens tensors.
-    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
-    #     backend that advertises supports_prefix_kv_slicing.
+    #   "valid_kv_length": int — contiguous valid prefix length for a backend
+    #     that advertises prefix slicing support.
     #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
     #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
     #     Requires the [real, pad] two-document packing contract; see

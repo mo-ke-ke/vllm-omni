@@ -706,6 +706,51 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
     assert attention.attention.metadata.extra["valid_kv_length"] == 5
 
 
+def test_packed_attention_skips_mask_for_packed_prefix_backend():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3Attention,
+    )
+
+    class FakeBackend:
+        supports_prefix_kv_slicing = False
+        supports_packed_prefix_slicing = True
+
+        @classmethod
+        def supports_packed_mask_free(cls) -> bool:
+            return False
+
+    class FakeAttention(torch.nn.Module):
+        attn_backend = FakeBackend
+
+        def __init__(self):
+            super().__init__()
+            self.metadata = None
+
+        def forward(self, query, key, value, metadata):
+            self.metadata = metadata
+            return query
+
+    attention = object.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.attention = FakeAttention()
+    q = torch.randn(8, 2, 4)
+    cu_seqlens = torch.tensor([0, 5, 8], dtype=torch.int32)
+
+    attention._run_packed_attention(
+        q,
+        q,
+        q,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=5,
+        packed_total=8,
+    )
+
+    metadata = attention.attention.metadata
+    assert metadata.attn_mask is None
+    assert metadata.extra["cu_seqlens_q"] is cu_seqlens
+    assert metadata.extra["valid_kv_length"] == 5
+
+
 def test_packed_attention_skips_mask_for_packed_mask_free_backend():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
