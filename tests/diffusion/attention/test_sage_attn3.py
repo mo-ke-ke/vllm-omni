@@ -45,6 +45,23 @@ def packed_metadata(
     )
 
 
+def make_impl(backend_module):
+    return backend_module.SageAttention3Impl(
+        num_heads=4,
+        head_size=64,
+        softmax_scale=1.0 / 8.0,
+        causal=False,
+    )
+
+
+def validation_backend(monkeypatch: pytest.MonkeyPatch):
+    def unexpected_kernel(*args, **kwargs):
+        raise AssertionError("invalid metadata must fail before kernel dispatch")
+
+    backend_module = load_sage_attn3_module(monkeypatch, unexpected_kernel)
+    return backend_module, make_impl(backend_module)
+
+
 def test_sage_attn3_forward_uses_blackwell_layout(monkeypatch: pytest.MonkeyPatch):
     calls = {}
 
@@ -54,12 +71,7 @@ def test_sage_attn3_forward_uses_blackwell_layout(monkeypatch: pytest.MonkeyPatc
         return query + key + value
 
     backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
-    impl = backend_module.SageAttention3Impl(
-        num_heads=4,
-        head_size=64,
-        softmax_scale=1.0 / 8.0,
-        causal=False,
-    )
+    impl = make_impl(backend_module)
 
     query = torch.randn(2, 8, 4, 64)
     key = torch.randn(2, 8, 4, 64)
@@ -84,12 +96,7 @@ def test_sage_attn3_packed_prefix_excludes_and_restores_padding(
 
     backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
     assert backend_module.SageAttention3Backend.supports_packed_prefix_slicing
-    impl = backend_module.SageAttention3Impl(
-        num_heads=4,
-        head_size=64,
-        softmax_scale=1.0 / 8.0,
-        causal=False,
-    )
+    impl = make_impl(backend_module)
     query = torch.randn(2, 8, 4, 64)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
@@ -110,6 +117,184 @@ def test_sage_attn3_packed_prefix_excludes_and_restores_padding(
     assert torch.count_nonzero(output[:, 5:]) == 0
 
 
+def test_sage_attn3_packed_gqa_fallback_excludes_padding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_kernel(*args, **kwargs):
+        raise AssertionError("packed GQA must use exact SDPA")
+
+    backend_module = load_sage_attn3_module(monkeypatch, fake_kernel)
+    calls = {}
+
+    def fake_sdpa(query, key, value, **kwargs):
+        calls["shapes"] = (query.shape, key.shape, value.shape)
+        calls["enable_gqa"] = kwargs["enable_gqa"]
+        return query + 1
+
+    monkeypatch.setattr(
+        backend_module.F,
+        "scaled_dot_product_attention",
+        fake_sdpa,
+    )
+    impl = make_impl(backend_module)
+    query = torch.randn(2, 8, 4, 64)
+    key = torch.randn(2, 8, 2, 64)
+    value = torch.randn_like(key)
+
+    output = impl.forward_cuda(
+        query,
+        key,
+        value,
+        packed_metadata(
+            backend_module,
+            valid_length=5,
+            physical_length=8,
+        ),
+    )
+
+    assert calls["shapes"] == (
+        (2, 4, 5, 64),
+        (2, 2, 5, 64),
+        (2, 2, 5, 64),
+    )
+    assert calls["enable_gqa"] is True
+    assert output.shape == query.shape
+    assert torch.count_nonzero(output[:, 5:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("remove", "updates", "message"),
+    [
+        (
+            "cu_seqlens_k",
+            {},
+            "Incomplete packed SAGE_ATTN_3 metadata",
+        ),
+        (None, {"cu_seqlens_q": [0, 5, 8]}, "must be a torch.Tensor"),
+        (
+            None,
+            {"cu_seqlens_q": torch.tensor([0, 5], dtype=torch.int32)},
+            "must contain three boundaries",
+        ),
+        (
+            None,
+            {"cu_seqlens_q": torch.tensor([0, 5, 8], dtype=torch.int64)},
+            "must use torch.int32",
+        ),
+        (None, {"max_seqlen_q": True}, "lengths must be plain integers"),
+        (None, {"max_seqlen_k": 4}, "equal max and valid lengths"),
+        (
+            None,
+            {
+                "cu_seqlens_q": torch.tensor([0, 9, 8], dtype=torch.int32),
+                "cu_seqlens_k": torch.tensor([0, 9, 8], dtype=torch.int32),
+                "max_seqlen_q": 9,
+                "max_seqlen_k": 9,
+                "valid_kv_length": 9,
+            },
+            "within the physical sequence",
+        ),
+        (
+            None,
+            {
+                "cu_seqlens_q": torch.empty(
+                    3,
+                    dtype=torch.int32,
+                    device="meta",
+                )
+            },
+            "cu_seqlens_q must be on cpu",
+        ),
+    ],
+    ids=(
+        "incomplete",
+        "non-tensor-cu-seqlens",
+        "cu-seqlens-count",
+        "cu-seqlens-dtype",
+        "length-type",
+        "max-mismatch",
+        "length-exceeds-physical",
+        "cu-seqlens-device",
+    ),
+)
+def test_sage_attn3_rejects_malformed_packed_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    remove: str | None,
+    updates: dict[str, object],
+    message: str,
+):
+    backend_module, impl = validation_backend(monkeypatch)
+    metadata = packed_metadata(
+        backend_module,
+        valid_length=5,
+        physical_length=8,
+    )
+    if remove is not None:
+        metadata.extra.pop(remove)
+    metadata.extra.update(updates)
+    q = torch.randn(1, 8, 4, 64)
+
+    with pytest.raises(ValueError, match=message):
+        impl.forward_cuda(q, q, q, metadata)
+
+
+@pytest.mark.parametrize(
+    ("query_shape", "key_shape", "value_shape", "message"),
+    [
+        ((1, 8, 64), (1, 8, 64), (1, 8, 64), "4D Q/K/V tensors"),
+        (
+            (1, 8, 4, 64),
+            (1, 7, 4, 64),
+            (1, 7, 4, 64),
+            "matching Q/K/V batch and sequence dimensions",
+        ),
+    ],
+)
+def test_sage_attn3_rejects_invalid_packed_qkv_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    query_shape: tuple[int, ...],
+    key_shape: tuple[int, ...],
+    value_shape: tuple[int, ...],
+    message: str,
+):
+    backend_module, impl = validation_backend(monkeypatch)
+    metadata = packed_metadata(
+        backend_module,
+        valid_length=5,
+        physical_length=8,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        impl.forward_cuda(
+            torch.randn(query_shape),
+            torch.randn(key_shape),
+            torch.randn(value_shape),
+            metadata,
+        )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_sage_attn3_rejects_attention_masks(
+    monkeypatch: pytest.MonkeyPatch,
+    packed: bool,
+):
+    backend_module, impl = validation_backend(monkeypatch)
+    metadata = (
+        packed_metadata(
+            backend_module,
+            valid_length=5,
+            physical_length=8,
+        )
+        if packed
+        else backend_module.AttentionMetadata()
+    )
+    metadata.attn_mask = torch.ones(1, 8, dtype=torch.bool)
+    q = torch.randn(1, 8, 4, 64)
+
+    with pytest.raises(ValueError, match="does not support arbitrary attention masks"):
+        impl.forward_cuda(q, q, q, metadata)
+
+
 def test_sage_attn3_falls_back_to_sdpa_for_gqa(monkeypatch: pytest.MonkeyPatch):
     def fake_kernel(*args, **kwargs):
         raise AssertionError("sageattn3_blackwell should not be used for GQA")
@@ -125,12 +310,7 @@ def test_sage_attn3_falls_back_to_sdpa_for_gqa(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(backend_module.F, "scaled_dot_product_attention", fake_sdpa)
 
-    impl = backend_module.SageAttention3Impl(
-        num_heads=4,
-        head_size=64,
-        softmax_scale=1.0 / 8.0,
-        causal=False,
-    )
+    impl = make_impl(backend_module)
 
     query = torch.randn(2, 8, 4, 64)
     key = torch.randn(2, 8, 2, 64)

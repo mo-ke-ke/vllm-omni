@@ -47,6 +47,14 @@ if not hasattr(torch.ops.vllm_omni, "sageattn3_blackwell"):
 
 _sageattn3_blackwell_op = torch.ops.vllm_omni.sageattn3_blackwell
 
+_PACKED_PREFIX_KEYS = (
+    "cu_seqlens_q",
+    "cu_seqlens_k",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "valid_kv_length",
+)
+
 
 class SageAttention3Backend(AttentionBackend):
     accept_output_buffer: bool = True
@@ -84,11 +92,51 @@ class SageAttention3Impl(AttentionImpl):
 
     @staticmethod
     def _packed_prefix_length(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> int | None:
         if attn_metadata is None:
             return None
-        return attn_metadata.extra.get("valid_kv_length")
+        if attn_metadata.attn_mask is not None:
+            raise ValueError("SAGE_ATTN_3 does not support arbitrary attention masks")
+
+        extra = attn_metadata.extra
+        present = [name for name in _PACKED_PREFIX_KEYS if name in extra]
+        if not present:
+            return None
+        if len(present) != len(_PACKED_PREFIX_KEYS):
+            missing = sorted(set(_PACKED_PREFIX_KEYS) - set(present))
+            raise ValueError(f"Incomplete packed SAGE_ATTN_3 metadata; missing {missing}")
+        if any(tensor.ndim != 4 for tensor in (query, key, value)):
+            raise ValueError("Packed SAGE_ATTN_3 requires 4D Q/K/V tensors")
+        if query.shape[:2] != key.shape[:2] or key.shape[:2] != value.shape[:2]:
+            raise ValueError("Packed SAGE_ATTN_3 requires matching Q/K/V batch and sequence dimensions")
+
+        for name, device in (
+            ("cu_seqlens_q", query.device),
+            ("cu_seqlens_k", key.device),
+        ):
+            cu_seqlens = extra[name]
+            if not isinstance(cu_seqlens, torch.Tensor):
+                raise ValueError(f"{name} must be a torch.Tensor")
+            if cu_seqlens.ndim != 1 or cu_seqlens.numel() != 3:
+                raise ValueError(f"{name} must contain three boundaries")
+            if cu_seqlens.dtype != torch.int32:
+                raise ValueError(f"{name} must use torch.int32")
+            if cu_seqlens.device != device:
+                raise ValueError(f"{name} must be on {device}")
+
+        lengths = tuple(extra[name] for name in _PACKED_PREFIX_KEYS[2:])
+        if any(type(length) is not int for length in lengths):
+            raise ValueError("Packed SAGE_ATTN_3 lengths must be plain integers")
+        max_q, max_k, valid_length = lengths
+        if max_q != max_k or max_q != valid_length:
+            raise ValueError("Packed SAGE_ATTN_3 requires equal max and valid lengths")
+        if not 0 < valid_length <= query.shape[1]:
+            raise ValueError("valid_kv_length must be within the physical sequence")
+        return valid_length
 
     @staticmethod
     def _restore_physical_length(
@@ -114,7 +162,12 @@ class SageAttention3Impl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         physical_length = query.shape[1]
-        valid_length = self._packed_prefix_length(attn_metadata)
+        valid_length = self._packed_prefix_length(
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
         if valid_length is not None:
             query = query[:, :valid_length]
             key = key[:, :valid_length]
